@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: smart-energy-optimizer
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
