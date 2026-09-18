@@ -8,7 +8,8 @@ def run_pipeline(request):
     validate_request(request)
 
     directives = interpret_notes(
-        request.operator_notes
+        request.operator_notes,
+        request.battery.model_dump()
     )
 
     validate_directives(

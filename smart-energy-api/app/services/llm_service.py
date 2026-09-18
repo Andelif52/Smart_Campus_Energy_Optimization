@@ -208,11 +208,9 @@ def _user_message(notes, battery, only=None, feedback=None):
     )
 
     if feedback:
-        msg += (
-            "\n\nPrevious answer rejected:\n"
+        msg += ("\n\nYour previous answer was rejected by the validator:\n"
             + "\n".join(feedback)
-            + "\nCorrect the mistakes."
-        )
+            + "\nPlease correct the mistakes.")
 
     return msg
 
