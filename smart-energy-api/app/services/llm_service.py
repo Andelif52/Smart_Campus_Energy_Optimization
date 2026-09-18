@@ -1,187 +1,354 @@
 """
-LLM Interpreter (Problem Statement sections 03, 04, 05.1, 08, 11).
+LLM Interpreter using Google Gemini REST API.
 
 For teammates:
     from app.services.llm_service import interpret_notes
     entries = interpret_notes(notes, battery)
+
 `entries` is the spec-exact directive_interpretation list.
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 
+import requests
 from dotenv import load_dotenv
 
 from app.services.guardrails import (
-    GuardrailError, build_entry, no_op_entry, validate_final,
+    GuardrailError,
+    build_entry,
+    no_op_entry,
+    validate_final,
 )
 
 load_dotenv()
+
 log = logging.getLogger("llm_service")
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "25"))
 
-SYSTEM_PROMPT = """You interpret campus energy operator notes for a 24-hour \
-battery/solar/grid schedule (hours 0-23 of TODAY). For each note choose EXACTLY ONE directive_type:
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/"
+    "models/{model}:generateContent"
+)
 
-solar_reduction          - usable rooftop solar (PV) is reduced during some hours.
-                           Give "factor" = fraction of solar that REMAINS (0..1).
-                           "80% reduction" -> 0.2 ; "drops to 20%" -> 0.2 ; "about 25% of forecast" -> 0.25 ;
-                           "half"/"50% less" -> 0.5 ; "one-fifth of normal" -> 0.2 ; "no solar at all" -> 0.
-minimum_battery_reserve  - battery must keep AT LEAST some energy stored during some hours.
-                           Give "minimum_energy_kwh" if kWh is stated, OR "reserve_percent_of_capacity"
-                           (0-100) if it is stated as a percentage/fraction of capacity ("half full" -> 50).
-no_charge_window         - battery charging is not allowed / charger unavailable, isolated, disabled.
-no_discharge_window      - battery must not discharge / not supply power / discharge disabled.
-max_grid_window          - grid import/intake must not exceed X kWh per hour (feeder, transformer,
-                           substation limit). Give "max_grid_kwh".
-no_op                    - the note does not change TODAY's energy schedule.
 
-no_op rules (very important):
-- Unrelated topics (menus, libraries, bookings, deadlines, notices, events without an energy rule) -> no_op.
-- Anything about tomorrow, next week, next month, or the past -> no_op.
-- Energy-sounding notes that do not match one of the five types above (e.g. "demand will rise",
-  "tariffs may change", "install new panels") -> no_op. Never invent a new type or change demand/tariffs.
+SYSTEM_PROMPT = """You interpret campus energy operator notes for a 24-hour
+battery/solar/grid schedule (hours 0-23 of TODAY).
 
-Time windows:
-- Return windows as start_hour and end_hour in 24-hour time. end_hour is the END time as written;
-  the window covers start_hour up to but NOT including end_hour. "1 PM to 3 PM" -> start 13, end 15.
-- noon = 12. midnight at the start of a window = 0; "until midnight" -> end_hour 24.
-- "13:00-15:00", "from one until three" (afternoon context), "the 1-3 PM window" all -> 13..15.
-- A single hour ("at 7 PM for one hour", "during the 19:00 hour") -> start 19, end 20.
-- Overnight windows are fine: "10 PM to 2 AM" -> start 22, end 2.
-- Use several windows only if the note truly lists separate periods.
+For each note choose EXACTLY ONE directive_type:
 
-Copy numbers exactly from the note; do not guess values that are not stated.
-Write a short plain-English explanation for each note. Call the tool exactly once \
-with one entry per note, using the given note_index values."""
+solar_reduction:
+- Solar generation is reduced.
+- Give factor = fraction of solar remaining (0..1).
 
-TOOL = {
-    "name": "record_interpretations",
-    "description": "Record the interpretation of every operator note.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "interpretations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "note_index": {"type": "integer"},
-                        "directive_type": {"type": "string", "enum": [
-                            "solar_reduction", "minimum_battery_reserve",
-                            "no_charge_window", "no_discharge_window",
-                            "max_grid_window", "no_op"]},
-                        "windows": {"type": "array", "items": {
-                            "type": "object",
-                            "properties": {
-                                "start_hour": {"type": "integer"},
-                                "end_hour": {"type": "integer"}},
-                            "required": ["start_hour", "end_hour"]}},
-                        "factor": {"type": "number"},
-                        "minimum_energy_kwh": {"type": "number"},
-                        "reserve_percent_of_capacity": {"type": "number"},
-                        "max_grid_kwh": {"type": "number"},
-                        "explanation": {"type": "string"},
-                    },
-                    "required": ["note_index", "directive_type", "explanation"],
-                },
-            }
-        },
-        "required": ["interpretations"],
-    },
+minimum_battery_reserve:
+- Battery must keep minimum stored energy.
+- Use minimum_energy_kwh or reserve_percent_of_capacity.
+
+no_charge_window:
+- Battery charging is not allowed.
+
+no_discharge_window:
+- Battery discharge is not allowed.
+
+max_grid_window:
+- Grid import must not exceed a limit.
+- Give max_grid_kwh.
+
+no_op:
+- The note does not affect today's energy schedule.
+
+Rules:
+- Ignore unrelated topics.
+- Ignore future/past events.
+- Do not invent new directive types.
+- Copy numbers exactly.
+- Return hours as start_hour and end_hour.
+- Use end_hour as exclusive.
+
+Return ONLY JSON.
+
+Format:
+
+{
+ "interpretations": [
+   {
+    "note_index": 0,
+    "directive_type": "no_charge_window",
+    "windows": [
+       {
+        "start_hour": 14,
+        "end_hour": 16
+       }
+    ],
+    "factor": null,
+    "minimum_energy_kwh": null,
+    "reserve_percent_of_capacity": null,
+    "max_grid_kwh": null,
+    "explanation": "Battery charging is disabled during this period."
+   }
+ ]
 }
 
-_client = None
+For no_op:
+- windows must be null.
+- unused numeric fields must be null.
+"""
 
 
-def _get_client():
-    global _client
-    if _client is None:
-        import anthropic  # lazy import so offline tests need no key
-        _client = anthropic.Anthropic(timeout=TIMEOUT_S, max_retries=1)
-    return _client
+def _extract_json(text: str):
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = text.replace("```json", "")
+        text = text.replace("```", "")
+
+    return json.loads(text.strip())
 
 
-def call_claude(user_text: str) -> list[dict]:
-    """One LLM call. Returns the raw list of interpretations."""
-    resp = _get_client().messages.create(
-        model=MODEL,
-        max_tokens=1500,
-        system=SYSTEM_PROMPT,
-        tools=[TOOL],
-        tool_choice={"type": "tool", "name": "record_interpretations"},
-        messages=[{"role": "user", "content": user_text}],
+def call_gemini(user_text: str) -> list[dict]:
+    """
+    One Gemini API call.
+    Returns raw interpretation list.
+    """
+
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise GuardrailError(
+            "GEMINI_API_KEY is not set"
+        )
+
+    body = {
+        "system_instruction": {
+            "parts": [
+                {
+                    "text": SYSTEM_PROMPT
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": user_text
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        },
+    }
+
+    response = requests.post(
+        GEMINI_URL.format(model=MODEL),
+        headers={
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=TIMEOUT_S,
     )
-    for block in resp.content:
-        if block.type == "tool_use":
-            items = block.input.get("interpretations")
-            if isinstance(items, list):
-                return items
-    raise GuardrailError("LLM did not return interpretations")
+
+    if response.status_code != 200:
+        raise GuardrailError(
+            f"Gemini HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    data = response.json()
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+
+        text = "".join(
+            part.get("text", "")
+            for part in parts
+        )
+
+    except (KeyError, IndexError, TypeError):
+        raise GuardrailError(
+            f"Unexpected Gemini response: {str(data)[:300]}"
+        )
+
+    parsed = _extract_json(text)
+
+    if isinstance(parsed, dict):
+        items = parsed.get("interpretations")
+    else:
+        items = parsed
+
+    if not isinstance(items, list):
+        raise GuardrailError(
+            "Gemini did not return interpretations list"
+        )
+
+    return items
 
 
 def _user_message(notes, battery, only=None, feedback=None):
+
     idx = range(len(notes)) if only is None else only
-    listed = "\n".join(f"note_index {i}: {json.dumps(notes[i])}" for i in idx)
-    msg = (f"Battery capacity: {battery['capacity_kwh']} kWh.\n"
-           f"Interpret these operator notes:\n{listed}")
+
+    listed = "\n".join(
+        f"note_index {i}: {json.dumps(notes[i])}"
+        for i in idx
+    )
+
+    msg = (
+        f"Battery capacity: {battery['capacity_kwh']} kWh.\n"
+        f"Interpret these operator notes:\n{listed}"
+    )
+
     if feedback:
-        msg += ("\n\nYour previous answer for these notes was rejected by the "
-                "validator:\n" + "\n".join(feedback) + "\nPlease correct it.")
+        msg += (
+            "\n\nPrevious answer rejected:\n"
+            + "\n".join(feedback)
+            + "\nCorrect the mistakes."
+        )
+
     return msg
 
 
 def _convert(raw_items, wanted, battery, entries, errors):
+
     by_index = {}
+
     for item in raw_items if isinstance(raw_items, list) else []:
-        if isinstance(item, dict) and isinstance(item.get("note_index"), int):
-            by_index.setdefault(item["note_index"], item)   # first one wins
+
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("note_index"), int)
+        ):
+            by_index.setdefault(
+                item["note_index"],
+                item
+            )
+
     for i in wanted:
+
         if i not in by_index:
-            errors[i] = "no interpretation returned for this note"
+            errors[i] = (
+                "no interpretation returned for this note"
+            )
             continue
+
         try:
-            entries[i] = build_entry(by_index[i], i, battery)
+            entries[i] = build_entry(
+                by_index[i],
+                i,
+                battery
+            )
+
             errors.pop(i, None)
+
         except GuardrailError as e:
             errors[i] = str(e)
 
 
-def interpret_notes(notes, battery, llm=call_claude):
-    """Main entry point. Always returns one valid entry per note."""
+def interpret_notes(notes, battery, llm=call_gemini):
+
     n = len(notes)
-    entries: dict[int, dict] = {}
-    errors: dict[int, str] = {}
 
-    # Attempt 1: all notes together
+    entries = {}
+    errors = {}
+
     try:
-        _convert(llm(_user_message(notes, battery)), range(n), battery, entries, errors)
+
+        _convert(
+            llm(
+                _user_message(
+                    notes,
+                    battery
+                )
+            ),
+            range(n),
+            battery,
+            entries,
+            errors
+        )
+
     except Exception as e:
-        log.warning("LLM call failed: %s", type(e).__name__)
-        errors = {i: "LLM call failed" for i in range(n)}
 
-    # Attempt 2: re-ask only failed notes, showing the validator errors
+        log.warning(
+            "LLM call failed: %s - %s",
+            type(e).__name__,
+            e
+        )
+
+        errors = {
+            i: "LLM call failed"
+            for i in range(n)
+        }
+
+
     if errors:
+
         failed = sorted(errors)
-        feedback = [f"note_index {i}: {errors[i]}" for i in failed]
+
+        feedback = [
+            f"note_index {i}: {errors[i]}"
+            for i in failed
+        ]
+
         try:
-            _convert(llm(_user_message(notes, battery, failed, feedback)),
-                     failed, battery, entries, errors)
+
+            _convert(
+                llm(
+                    _user_message(
+                        notes,
+                        battery,
+                        failed,
+                        feedback
+                    )
+                ),
+                failed,
+                battery,
+                entries,
+                errors
+            )
+
         except Exception as e:
-            log.warning("LLM retry failed: %s", type(e).__name__)
 
-    # Safe failure: anything still invalid becomes no_op
+            log.warning(
+                "LLM retry failed: %s - %s",
+                type(e).__name__,
+                e
+            )
+
+
     for i in range(n):
-        if i not in entries:
-            log.warning("note %d fell back to no_op: %s", i, errors.get(i))
-            entries[i] = no_op_entry(
-                i, "The note could not be interpreted reliably, so no directive was applied.")
 
-    result = [entries[i] for i in range(n)]
-    if validate_final(result, n, battery):      # should never happen
-        result = [no_op_entry(i) for i in range(n)]
+        if i not in entries:
+
+            entries[i] = no_op_entry(
+                i,
+                "The note could not be interpreted reliably."
+            )
+
+
+    result = [
+        entries[i]
+        for i in range(n)
+    ]
+
+
+    if validate_final(
+        result,
+        n,
+        battery
+    ):
+        result = [
+            no_op_entry(i)
+            for i in range(n)
+        ]
+
+
     return result
